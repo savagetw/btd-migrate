@@ -21,7 +21,7 @@ var output = {};
 
 const tables = [
     {name: 'Addresses', collection: 'people', transform: transformAddresses}, 
-    {name: 'Table Names', collection: 'tables'},
+    {name: 'Table Names', collection: 'tables', transform: transformTables},
     {name: 'Team Jobs', collection: 'weekend-roles', transform: transformJobs}, 
     {name: 'ExperienceMale', collection: 'weekends-male', transform: transformMaleExperience}, 
     {name: 'ExperienceFemale', collection: 'weekends-female', transform: transformFemaleExperience}
@@ -39,6 +39,15 @@ db.openAsync(cn)
         console.log('Caught err: ', err);
     });
 
+function writeFile(filename, data) {
+    var dir = 'output';
+    if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir);
+    }
+    fs.writeFileSync(dir + '/' + filename, data);
+    console.log('Wrote ' + filename + '.json');
+}
+
 function get(db, tables) {
     return Promise.all(tables.map(function (table) {
         return db.queryAsync('SELECT * FROM `' + table.name + '`')
@@ -50,10 +59,11 @@ function get(db, tables) {
                 console.log('First for ' + table.collection + ':', data[0]);
 
                 output[table.collection] = data;
-                fs.writeFileSync(table.collection + '.json', JSON.stringify(data));
-                console.log('Wrote ' + table.collection + '.json');
+                writeFile(table.collection + '.json', JSON.stringify(data));
             });
     })).then(function () {
+        _.forEach(PeopleByMigrationId, addToCandidateWeekend);
+
         var weekends = [];
         _.forEach(Weekends.Male, function (weekend, weekendNumber) {
             resolvePeopleAndRoles(weekend);
@@ -63,13 +73,17 @@ function get(db, tables) {
             resolvePeopleAndRoles(weekend);
             weekends.push(weekend);
         });
-        fs.writeFileSync('weekends.json', JSON.stringify(weekends));
+        writeFile('weekends.json', JSON.stringify(weekends));
         console.log('Wrote weekends.json');
     });
 }
 
 function resolvePeopleAndRoles(weekend) {
     var resolved = weekend.attendees.map(function (attendee) {
+        if (!attendee.migrationPersonId) {
+            return attendee;
+        }
+
         var person = PeopleByMigrationId[attendee.migrationPersonId];
         if (person) {
             attendee.personId = person._id;
@@ -118,7 +132,7 @@ function transformAddresses(addresses) {
         delete person.migrationSponsorSearch;
     });
 
-    fs.writeFileSync('Churches.json', JSON.stringify(Churches.map(function (Church) {
+    writeFile('churches.json', JSON.stringify(Churches.map(function (Church) {
         return {
             _id: Church._id,
             location: {
@@ -145,7 +159,8 @@ function transformAddresses(addresses) {
                     country: 'USA',
                     zip: address.PostalCode,
                     label: 'Home'
-                }
+                },
+                candidateOn: getWeekendNumber(discriminator, address)
             };
             assignChurch(person, address);
             maybeSet(person, address, [
@@ -161,6 +176,11 @@ function transformAddresses(addresses) {
             
             return person;
         }
+    }
+
+    function getWeekendNumber(discriminator, address) {
+        var fieldName = discriminator + 'Weekend';
+        return address[fieldName + '#'] || address[fieldName + ' #'];
     }
 
     function insertStatus(person, address, discriminator) {
@@ -317,8 +337,9 @@ function transformExperience(discriminator, experiences) {
 }
 
 var WeekendRolesByMigrationId = {};
+var candidateRoleId;
 function transformJobs(jobs) {
-    return jobs.map(function (job) {
+    var transformedJobs = jobs.map(function (job) {
         var role = {
             _id: Random.id(),
             migrationId: job.ID,
@@ -327,9 +348,20 @@ function transformJobs(jobs) {
         role.isHead = contains(job.Job, ['Head', 'Rover', 'Rector']);
         role.isProfessor = contains(job.Job, ['Prof']);
         
-        WeekendRolesByMigrationId[role.migrationId] = role;
+        WeekendRolesByMigrationId[role.migrationId] = _.cloneDeep(role);
+        delete role.migrationId;
         return role;
     });
+
+    candidateRoleId = Random.id();
+    transformedJobs.push({
+        _id: candidateRoleId,
+        title: 'Candidate',
+        isHead: false,
+        isProfessor: false
+    });
+
+    return transformedJobs;
 }
 
 function contains(str, searches) {
@@ -343,14 +375,48 @@ function buildWeekends(discriminator, experiences) {
     experiences.forEach(function (experience) {
         var weekendNumber = experience['BTD#'];
         if (weekendNumber && !Weekends[discriminator][weekendNumber]) {
-            Weekends[discriminator][weekendNumber] = {
-                _id: Random.id(),
-                community: 'Birmingham Tres Dias',
-                gender: discriminator,
-                weekendNumber: weekendNumber,
-                attendees: []
-            };
+            Weekends[discriminator][weekendNumber] = new Weekend(discriminator, weekendNumber);
             console.log('added weekend ' + discriminator + ' ' + weekendNumber);
         }
     });
+}
+
+function Weekend(gender, weekendNumber_) {
+    this._id = Random.id();           
+    this.community = 'Birmingham Tres Dias';
+    this.gender = gender;
+    this.weekendNumber = weekendNumber_;
+    this.attendees = [];
+}
+
+function transformTables(tables) {
+    return tables.map(function (table) {
+        return {
+            _id: Random.id(),
+            name: table['Table Name'],
+            gender: table['MensLadies']
+        }
+    });
+}
+
+function addToCandidateWeekend(person) {
+    if (!person.candidateOn) {
+        return;
+    }
+
+    var discriminator = _.capitalize(person.gender);
+    var weekend = Weekends[discriminator][person.candidateOn];
+
+    var attendance = {
+        personId: person._id,
+        roleId: candidateRoleId,
+        isConfirmed: true,
+        didAttend: true
+    };
+
+    if (!weekend) {
+        weekend = new Weekend(discriminator, person.candidateOn);
+        Weekends[discriminator][person.candidateOn] = weekend;
+    }
+    weekend.attendees.push(attendance);
 }
