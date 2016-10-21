@@ -15,16 +15,16 @@ var Random = require('meteor-random');
 
 Promise.promisifyAll(db);
 
-console.log('provider string: ', cn);
+console.log('Provider string:', cn);
 
 var output = {};
 
 const tables = [
-    {name: 'Addresses', collection: 'people', transform: transformAddresses}, 
-    {name: 'Table Names', collection: 'tables', transform: transformTables},
-    {name: 'Team Jobs', collection: 'weekend-roles', transform: transformJobs}, 
-    {name: 'ExperienceMale', collection: 'weekends-male', transform: transformMaleExperience}, 
-    {name: 'ExperienceFemale', collection: 'weekends-female', transform: transformFemaleExperience}
+    {name: 'Addresses', collection: 'people', transform: transformAddresses, output: true}, 
+    {name: 'Table Names', collection: 'tables', transform: transformTables, output: false},
+    {name: 'Team Jobs', collection: 'weekend-roles', transform: transformJobs, output: true}, 
+    {name: 'ExperienceMale', collection: 'weekends-male', transform: transformMaleExperience, output: false}, 
+    {name: 'ExperienceFemale', collection: 'weekends-female', transform: transformFemaleExperience, output: false}
 ];
 
 db.openAsync(cn)
@@ -45,21 +45,14 @@ function writeFile(filename, data) {
         fs.mkdirSync(dir);
     }
     fs.writeFileSync(dir + '/' + filename, data);
-    console.log('Wrote ' + filename + '.json');
+    console.log('Wrote ' + filename);
 }
 
 function get(db, tables) {
     return Promise.all(tables.map(function (table) {
         return db.queryAsync('SELECT * FROM `' + table.name + '`')
             .then(function (data) {
-                if (table.transform) {
-                    data = table.transform(data);
-                }
-
-                console.log('First for ' + table.collection + ':', data[0]);
-
-                output[table.collection] = data;
-                writeFile(table.collection + '.json', JSON.stringify(data));
+                table.data = table.transform ? table.transform(data) : data;
             });
     })).then(function () {
         _.forEach(PeopleByMigrationId, addToCandidateWeekend);
@@ -69,12 +62,20 @@ function get(db, tables) {
             resolvePeopleAndRoles(weekend);
             weekends.push(weekend);
         });
+
         _.forEach(Weekends.Female, function (weekend, weekendNumber) {
             resolvePeopleAndRoles(weekend);
             weekends.push(weekend);
         });
+
         writeFile('weekends.json', JSON.stringify(weekends));
         console.log('Wrote weekends.json');
+
+        tables.forEach(function (table) {
+            if (table.output) {
+                writeFile(table.collection + '.json', JSON.stringify(table.data));
+            }
+        })
     });
 }
 
@@ -87,12 +88,23 @@ function resolvePeopleAndRoles(weekend) {
         var person = PeopleByMigrationId[attendee.migrationPersonId];
         if (person) {
             attendee.personId = person._id;
+            attendee.person = {
+                firstName: person.firstName,
+                preferredName: person.preferredName,
+                lastName: person.lastName
+            };
         }
         delete attendee.migrationPersonId;
 
         var role = WeekendRolesByMigrationId[attendee.migrationRoleId];
         if (role) {
             attendee.roleId = role._id;
+            attendee.roleTitle = role.title;
+
+            if (person) {
+                person.experience = person.experience || {};
+                person.experience[weekend.gender + ' #' + weekend.weekendNumber] = role.title;
+            }
         }
         delete attendee.migrationRoleId;
         return attendee;
@@ -124,6 +136,11 @@ function transformAddresses(addresses) {
             var sponsor = PeopleByMigrationId[migrationSponsorId];
             if (sponsor) {
                 person.sponsorId = sponsor._id;
+                person.sponsor = {
+                    firstName: sponsor.firstName,
+                    lastName: sponsor.lastName,
+                    preferredName: sponsor.preferredName
+                };
                 console.log(sponsor.firstName + ' ' + sponsor.lastName + ' sponsored ' + person.firstName + ' ' + person.lastName);
                 return true;
             }
@@ -168,7 +185,7 @@ function transformAddresses(addresses) {
                 {name: discriminator + ' DOB', property: 'birthDate'}
             ]);
             insertStatus(person, address, discriminator);
-            insertSponsorId(person, address, discriminator);
+            insertSponsor(person, address, discriminator);
             insertPhones(person, address, discriminator);
             insertEmails(person, address, discriminator);
             insertShirtSize(person, address[discriminator + 'ShirtSize'], defaultSize);
@@ -215,7 +232,7 @@ function transformAddresses(addresses) {
         }
     }
 
-    function insertSponsorId(person, address, discriminator) {
+    function insertSponsor(person, address, discriminator) {
         person.migrationSponsorSearch = [];
         if (discriminator === 'Female' && address['Sponsor Female ID#']) {
             person.migrationSponsorSearch.push(address['Sponsor Female ID#'] + 'Female');
@@ -238,6 +255,7 @@ function transformAddresses(addresses) {
                 Churches.push(newChurch);
             } else {
                 person.churchId = church._id;
+                person.church = address.Church;
             }
         }
     }
@@ -360,7 +378,7 @@ function transformJobs(jobs) {
         isHead: false,
         isProfessor: false
     });
-
+    
     return transformedJobs;
 }
 
@@ -409,7 +427,13 @@ function addToCandidateWeekend(person) {
 
     var attendance = {
         personId: person._id,
+        person: {
+            firstName: person.firstName,
+            preferredName: person.preferredName,
+            lastName: person.lastName
+        },
         roleId: candidateRoleId,
+        roleTitle: 'Candidate',
         isConfirmed: true,
         didAttend: true
     };
