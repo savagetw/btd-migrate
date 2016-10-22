@@ -1,3 +1,4 @@
+'use strict';
 
 var db = require('odbc')();
 
@@ -30,7 +31,59 @@ const tables = [
 db.openAsync(cn)
     .then(function() {  
     	console.log('Connected!');
-        return get(db, tables);
+        return processTables(db, tables);
+    })
+    .then(function () {
+        _.forEach(PeopleByMigrationId, addToCandidateWeekend);
+
+        var weekends = [];
+        ['Male', 'Female'].forEach(function (discriminator) {
+            _.forEach(Weekends[discriminator], function (weekend, weekendNumber) {
+                resolvePeopleAndRoles(weekend);
+                weekends.push(weekend);
+            });
+        });
+
+        // Slow dedupe
+        var merged = [];
+        _.forEach(PeopleByMigrationId, function (person, migrationId) {
+            if (person.isDupe) {
+                return;
+            }
+
+            var found;
+            _.forEach(PeopleByMigrationId, function (personInner, migrationIdInner) {
+                var match = ['firstName', 'lastName'].every(function (field) {
+                    return person[field] === personInner[field];
+                });
+
+                if (match && person.gender !== personInner.gender) {
+                    personInner.isDupe = true;
+                    found = true;
+                    merged.push([person, personInner]);
+                    return false;
+                }
+            });
+
+            if (!found) {
+                merged.push(person);
+            }
+        });
+
+        dedupeWeekendAttendees(weekends, merged);
+
+        writeFile('weekends.json', JSON.stringify(weekends));
+        console.log('Wrote weekends.json');
+
+        tables.forEach(function (table) {
+            if (table.collection === 'people') {
+                table.data = dedupePeople(merged);
+            }
+
+            if (table.output) {
+                writeFile(table.collection + '.json', JSON.stringify(table.data));
+            }
+        })
     })
     .then(function () {
         return db.closeAsync();
@@ -38,6 +91,41 @@ db.openAsync(cn)
     .catch(function(err) {
         console.log('Caught err: ', err);
     });
+
+function dedupePeople(merged) {
+    return merged.map(function (person) {
+        if (Array.isArray(person)) {
+            var ret = _.defaultsDeep(person[0], person[1]);
+            delete ret.isDupe;
+            return ret;
+        } else {
+            return person;
+        }
+    });
+}
+function dedupeWeekendAttendees(weekends, merged) {
+    weekends.forEach(function (weekend) {
+        weekend.attendees = weekend.attendees.map(function (attendee) {
+            _.forEach(merged, function (dupes) {
+                if (Array.isArray(dupes)) {
+                    _.forEach(dupes, function (dupe) {
+                        if (dupe._id === attendee.personId) {
+                            var correctPerson = dupes[0];
+                            attendee.personId = correctPerson._id;
+                            attendee.firstName = correctPerson.firstName;
+                            attendee.lastName = correctPerson.lastName;
+                            attendee.preferredName = correctPerson.preferredName;
+                            return false;
+                        }
+                    });
+                } else if (dupes._id === attendee.personId) {
+                    return false; //break
+                }
+            });
+            return attendee;
+        });
+    });
+}
 
 function writeFile(filename, data) {
     var dir = 'output';
@@ -48,35 +136,13 @@ function writeFile(filename, data) {
     console.log('Wrote ' + filename);
 }
 
-function get(db, tables) {
+function processTables(db, tables) {
     return Promise.all(tables.map(function (table) {
         return db.queryAsync('SELECT * FROM `' + table.name + '`')
             .then(function (data) {
                 table.data = table.transform ? table.transform(data) : data;
             });
-    })).then(function () {
-        _.forEach(PeopleByMigrationId, addToCandidateWeekend);
-
-        var weekends = [];
-        _.forEach(Weekends.Male, function (weekend, weekendNumber) {
-            resolvePeopleAndRoles(weekend);
-            weekends.push(weekend);
-        });
-
-        _.forEach(Weekends.Female, function (weekend, weekendNumber) {
-            resolvePeopleAndRoles(weekend);
-            weekends.push(weekend);
-        });
-
-        writeFile('weekends.json', JSON.stringify(weekends));
-        console.log('Wrote weekends.json');
-
-        tables.forEach(function (table) {
-            if (table.output) {
-                writeFile(table.collection + '.json', JSON.stringify(table.data));
-            }
-        })
-    });
+    }));
 }
 
 function resolvePeopleAndRoles(weekend) {
@@ -141,7 +207,6 @@ function transformAddresses(addresses) {
                     lastName: sponsor.lastName,
                     preferredName: sponsor.preferredName
                 };
-                console.log(sponsor.firstName + ' ' + sponsor.lastName + ' sponsored ' + person.firstName + ' ' + person.lastName);
                 return true;
             }
             return false;
@@ -394,7 +459,6 @@ function buildWeekends(discriminator, experiences) {
         var weekendNumber = experience['BTD#'];
         if (weekendNumber && !Weekends[discriminator][weekendNumber]) {
             Weekends[discriminator][weekendNumber] = new Weekend(discriminator, weekendNumber);
-            console.log('added weekend ' + discriminator + ' ' + weekendNumber);
         }
     });
 }
