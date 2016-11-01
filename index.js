@@ -180,8 +180,12 @@ function resolvePeopleAndRoles(weekend) {
             attendee.roleTitle = role.title;
 
             if (person) {
-                person.experience = person.experience || {};
-                person.experience[weekend.gender + ' #' + weekend.weekendNumber] = role.title;
+                person.experiences = person.experiences || [];
+                person.experiences.push({
+                    roleTitle: role.title,
+                    weekendNumber: weekend.weekendNumber,
+                    weekendGender: weekend.gender
+                });
             }
         }
         delete attendee.migrationRoleId;
