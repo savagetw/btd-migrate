@@ -96,7 +96,18 @@ db.openAsync(cn)
 function dedupePeople(merged) {
     return merged.map(function (person) {
         if (Array.isArray(person)) {
-            var ret = _.defaultsDeep(person[0], person[1]);
+            var a, b;
+            // Sometimes the "throw away" account is out of order. Guess that
+            // presence of a city in the address helps us find the correct
+            // primary record.
+            if (person[0].address.city) {
+                a = person[0];
+                b = person[1];
+            } else {
+                a = person[1];
+                b = person[0];
+            }
+            var ret = _.defaultsDeep(a, b);
             delete ret.isDupe;
             return ret;
         } else {
