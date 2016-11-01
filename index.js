@@ -21,7 +21,8 @@ console.log('Provider string:', cn);
 var output = {};
 
 const tables = [
-    {name: 'Addresses', collection: 'people', transform: transformAddresses, output: true}, 
+    {name: 'Addresses', collection: 'people', transform: transformAddresses, output: true},
+    {name: 'Archived Addresses', collection: 'people', transform: transformInactiveAddresses, output: false}, 
     {name: 'Table Names', collection: 'tables', transform: transformTables, output: false},
     {name: 'Team Jobs', collection: 'weekend-roles', transform: transformJobs, output: true}, 
     {name: 'ExperienceMale', collection: 'weekends-male', transform: transformMaleExperience, output: false}, 
@@ -179,7 +180,10 @@ function resolvePeopleAndRoles(weekend) {
 }
 
 var PeopleByMigrationId = {};
-function transformAddresses(addresses) {
+function transformInactiveAddresses(addresses) {
+    return transformAddresses(addresses, 'inactive');
+}
+function transformAddresses(addresses, statusOverride) {
     var Churches = [];
     var People = [];
     addresses.forEach(function (address) {
@@ -249,7 +253,11 @@ function transformAddresses(addresses) {
                 {name: discriminator + ' Pref Name', property: 'preferredName'},
                 {name: discriminator + ' DOB', property: 'birthDate'}
             ]);
-            insertStatus(person, address, discriminator);
+            if (statusOverride) {
+                person.status = statusOverride;
+            } else {
+                insertStatus(person, address, discriminator);
+            }
             insertSponsor(person, address, discriminator);
             insertPhones(person, address, discriminator);
             insertEmails(person, address, discriminator);
