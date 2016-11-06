@@ -1,6 +1,9 @@
 'use strict';
 
 var db = require('odbc')();
+var transformAddresses = require('./transformers/addresses.js');
+var experiencesTransformer = require('./transformers/experiences.js');
+var jobTransformer = require('./transformers/jobs.js');
 
 var dbFile = process.argv[2];
 if (!dbFile) {
@@ -18,124 +21,134 @@ Promise.promisifyAll(db);
 
 console.log('Provider string:', cn);
 
-var output = {};
-
-const tables = [
-    {name: 'Addresses', collection: 'people', transform: transformAddresses, output: true},
-    {name: 'Archived Addresses', collection: 'people', transform: transformInactiveAddresses, output: false}, 
-    {name: 'Table Names', collection: 'tables', transform: transformTables, output: false},
-    {name: 'Team Jobs', collection: 'weekend-roles', transform: transformJobs, output: true}, 
-    {name: 'ExperienceMale', collection: 'weekends-male', transform: transformMaleExperience, output: false}, 
-    {name: 'ExperienceFemale', collection: 'weekends-female', transform: transformFemaleExperience, output: false}
-];
-
+var people = [];
+var PeopleByMigrationId = {};
+var WeekendRolesByMigrationId = {};
 db.openAsync(cn)
     .then(function() {  
     	console.log('Connected!');
-        return processTables(db, tables);
+        return processTables(db, [
+            {name: 'Addresses', collection: 'people', transform: transformAddresses},
+            {name: 'Archived Addresses', collection: 'people', transform: transformInactiveAddresses}, 
+        ]);
     })
-    .then(function () {
-        _.forEach(PeopleByMigrationId, addToCandidateWeekend);
+    .spread(function (activeAddressesTransformations, inactiveAddressesTransformations) {
+        // Combine into a single all people collection
+        let activePeople = _.find(activeAddressesTransformations, {name: 'People'}).collection;
+        let inactivePeople = _.find(inactiveAddressesTransformations, {name: 'People'}).collection;
+        people = activePeople.concat(inactivePeople);
 
-        var weekends = [];
-        ['Male', 'Female'].forEach(function (discriminator) {
-            _.forEach(Weekends[discriminator], function (weekend, weekendNumber) {
-                resolvePeopleAndRoles(weekend);
-                weekends.push(weekend);
-            });
+        // Apparently, to workaround the application constraints of people working on an
+        // alternative gender weekend (e.g. Skip Massey working Transportation on a Female
+        // weekend), duplicate records were created for such a person... just with an
+        // alternative gender. :-/
+        people = dedupePeople(people);
+
+        // Get a hash to improve lookup time for other operations
+        PeopleByMigrationId = buildHash(people);
+
+        // For each person, resolve their sponsor's details
+        resolveSponsors(people, PeopleByMigrationId);
+
+        return processTables(db, [
+            {name: 'Table Names', collection: 'tables', transform: transformTables},
+            {name: 'Team Jobs', collection: 'weekend-roles', transform: jobTransformer.transform}, 
+            {name: 'ExperienceMale', collection: 'weekends-male', transform: transformMaleExperience}, 
+            {name: 'ExperienceFemale', collection: 'weekends-female', transform: transformFemaleExperience}
+        ]);
+    })
+    .spread(function (tableNames, teamJobsTransformations, maleExperiencesTransformations, femaleExperiencesTransformations) {
+        var maleWeekends = _.find(maleExperiencesTransformations, {name: 'Weekends'}).collection;
+        var femaleWeekends = _.find(femaleExperiencesTransformations, {name: 'Weekends'}).collection;
+        var weekends = maleWeekends.concat(femaleWeekends);
+
+        var weekendRoles = _.find(teamJobsTransformations, {name: 'WeekendRoles'}).collection;
+        WeekendRolesByMigrationId = buildHash(weekendRoles);
+
+        for (let migrationId in PeopleByMigrationId) {
+            addPeopleToCandidateWeekends(PeopleByMigrationId[migrationId], weekends);
+        }
+
+        weekends.forEach(function (weekend) {
+            resolvePeopleAndRoles(weekend, PeopleByMigrationId, WeekendRolesByMigrationId);
         });
 
-        // Slow dedupe
-        var merged = [];
-        _.forEach(PeopleByMigrationId, function (person, migrationId) {
-            if (person.isDupe) {
-                return;
-            }
-
-            var found;
-            _.forEach(PeopleByMigrationId, function (personInner, migrationIdInner) {
-                var match = ['firstName', 'lastName'].every(function (field) {
-                    return person[field] === personInner[field];
-                });
-
-                if (match && person.gender !== personInner.gender) {
-                    personInner.isDupe = true;
-                    found = true;
-                    merged.push([person, personInner]);
-                    return false;
-                }
-            });
-
-            if (!found) {
-                merged.push(person);
-            }
-        });
-
-        dedupeWeekendAttendees(weekends, merged);
-
+        writeFile('people.json', JSON.stringify(people));
         writeFile('weekends.json', JSON.stringify(weekends));
-        console.log('Wrote weekends.json');
-
-        tables.forEach(function (table) {
-            if (table.collection === 'people') {
-                table.data = dedupePeople(merged);
-            }
-
-            if (table.output) {
-                writeFile(table.collection + '.json', JSON.stringify(table.data));
-            }
-        })
+        writeFile('weekendRoles.json', JSON.stringify(weekendRoles));
     })
     .then(function () {
         return db.closeAsync();
     })
     .catch(function(err) {
         console.log('Caught err: ', err);
+        throw err;
     });
 
-function dedupePeople(merged) {
-    return merged.map(function (person) {
-        if (Array.isArray(person)) {
-            var a, b;
-            // Sometimes the "throw away" account is out of order. Guess that
-            // presence of a city in the address helps us find the correct
-            // primary record.
-            if (person[0].address.city) {
-                a = person[0];
-                b = person[1];
-            } else {
-                a = person[1];
-                b = person[0];
-            }
-            var ret = _.defaultsDeep(a, b);
-            delete ret.isDupe;
-            return ret;
+function dedupePeople(people) {
+    var peopleByName = {};
+
+    return people.filter(function isUnique(person) {
+        let key = getKey(person);
+        var found = peopleByName[key];
+        if (found) {
+            mergeDuplicate(found, person);
+            found.duplicates = found.duplicates || [];
+            found.duplicates.push(person.migrationId);
+            return false;
+        }
+
+        peopleByName[key] = person;
+        return true;
+    });
+
+    function getKey(person) {
+        return person.firstName + '.' + person.lastName;
+    }
+
+    function mergeDuplicate(person, duplicate) {
+        let merged = {};
+        if (person.status === 'active' && person.address.city) {
+            _.defaultsDeep(merged, person, duplicate);
         } else {
-            return person;
+            _.defaultsDeep(merged, duplicate, person);
+        }
+        _.assign(person, merged);
+    }
+}
+
+function buildHash(collection) {
+    let result = {};
+    collection.forEach(function (thing) {
+        result[thing.migrationId] = thing;
+        delete thing.migrationId;
+
+        if (thing.duplicates) {
+            thing.duplicates.forEach(function (duplicateMigrationId) {
+                result[duplicateMigrationId] = thing;
+            });
+            delete thing.duplicates;
         }
     });
+    return result;
 }
-function dedupeWeekendAttendees(weekends, merged) {
-    weekends.forEach(function (weekend) {
-        weekend.attendees = weekend.attendees.map(function (attendee) {
-            _.forEach(merged, function (dupes) {
-                if (Array.isArray(dupes)) {
-                    _.forEach(dupes, function (dupe) {
-                        if (dupe._id === attendee.personId) {
-                            var correctPerson = dupes[0];
-                            attendee.personId = correctPerson._id;
-                            attendee.firstName = correctPerson.firstName;
-                            attendee.lastName = correctPerson.lastName;
-                            attendee.preferredName = correctPerson.preferredName;
-                            return false;
-                        }
-                    });
-                } else if (dupes._id === attendee.personId) {
-                    return false; //break
-                }
-            });
-            return attendee;
+
+function resolveSponsors(people, peopleByMigrationId) {
+    people.forEach(function (person) {
+        person.migrationSponsorSearch.some(function (migrationSponsorId) {
+            var sponsor = peopleByMigrationId[migrationSponsorId];
+            if (sponsor) {
+                person.sponsor = {
+                    firstName: sponsor.firstName,
+                    lastName: sponsor.lastName,
+                    preferredName: sponsor.preferredName,
+                    _id: sponsor._id
+                };
+                return true;
+            }
+            return false;
         });
+        delete person.migrationSponsorSearch;
     });
 }
 
@@ -152,346 +165,64 @@ function processTables(db, tables) {
     return Promise.all(tables.map(function (table) {
         return db.queryAsync('SELECT * FROM `' + table.name + '`')
             .then(function (data) {
-                table.data = table.transform ? table.transform(data) : data;
+                return table.transform(data);
             });
     }));
 }
 
-function resolvePeopleAndRoles(weekend) {
-    var resolved = weekend.attendees.map(function (attendee) {
+function resolvePeopleAndRoles(weekend, PeopleByMigrationId, WeekendRolesByMigrationId) {
+    weekend.attendees = weekend.attendees.filter(function (attendee) {
         if (!attendee.migrationPersonId) {
-            return attendee;
+            return true;
         }
 
         var person = PeopleByMigrationId[attendee.migrationPersonId];
-        if (person) {
-            attendee.personId = person._id;
-            attendee.person = {
-                firstName: person.firstName,
-                preferredName: person.preferredName,
-                lastName: person.lastName
-            };
+        if (!person) {
+            console.log('WARN: Cannot resolve person for Weekend ' + weekend.gender + ' #' + weekend.weekendNumber + ' attendee ' + attendee.migrationPersonId);
+            return false;
         }
-        delete attendee.migrationPersonId;
 
         var role = WeekendRolesByMigrationId[attendee.migrationRoleId];
-        if (role) {
-            attendee.roleId = role._id;
-            attendee.roleTitle = role.title;
-
-            if (person) {
-                person.experiences = person.experiences || [];
-                person.experiences.push({
-                    roleTitle: role.title,
-                    weekendNumber: weekend.weekendNumber,
-                    weekendGender: weekend.gender
-                });
-            }
+        if (!role) {
+            console.log('WARN: Cannot resolve role for Weekend ' + weekend.gender + ' #' + weekend.weekendNumber + ' attendee ' + attendee.migrationPersonId);
+            return false;
         }
+
+        attendee.person = {
+            firstName: person.firstName,
+            preferredName: person.preferredName,
+            lastName: person.lastName,
+            _id: person._id
+        };
+
+        attendee.role = {
+            _id: role._id,
+            title: role.title
+        }
+
+        delete attendee.migrationPersonId;
         delete attendee.migrationRoleId;
-        return attendee;
+
+        person.experiences = person.experiences || [];
+        person.experiences.push({
+            roleTitle: role.title,
+            weekendNumber: weekend.weekendNumber,
+            weekendGender: weekend.gender
+        });
+        return true;
     });
-    weekend.attendees = resolved;
 }
 
-var PeopleByMigrationId = {};
 function transformInactiveAddresses(addresses) {
     return transformAddresses(addresses, 'inactive');
 }
-function transformAddresses(addresses, statusOverride) {
-    var Churches = [];
-    var People = [];
-    addresses.forEach(function (address) {
-        var male = parse('Male', address, 'XL');
-        var female = parse('Female', address, 'M');
-        if (male) {
-            if (female) {
-                male.spouse = female._id;
-                female.spouse = male._id;
-            }
-            People.push(male);
-        }
-        if (female) {
-            People.push(female);
-        }
-    });
-
-    People.forEach(function resolveSponsor(person) {
-        person.migrationSponsorSearch.some(function (migrationSponsorId) {
-            var sponsor = PeopleByMigrationId[migrationSponsorId];
-            if (sponsor) {
-                person.sponsorId = sponsor._id;
-                person.sponsor = {
-                    firstName: sponsor.firstName,
-                    lastName: sponsor.lastName,
-                    preferredName: sponsor.preferredName
-                };
-                return true;
-            }
-            return false;
-        });
-        delete person.migrationSponsorSearch;
-    });
-
-    writeFile('churches.json', JSON.stringify(Churches.map(function (Church) {
-        return {
-            _id: Church._id,
-            location: {
-                label: Church.label
-            }
-        };
-    })));
-
-    return People;
-
-    function parse(discriminator, address, defaultSize) {
-        var firstName = address[discriminator + ' First Name'];
-        if (firstName) {
-            var person = {
-                _id: Random.id(),
-                firstName: firstName,
-                lastName: address['LastName'], 
-                gender: discriminator.toLowerCase(),
-                isPastor: address['Pastor'],
-                address: {
-                    street: address.Address,
-                    city: address.City,
-                    state: address.StateOrProvince,
-                    country: 'USA',
-                    zip: address.PostalCode,
-                    label: 'Home'
-                },
-                candidateOn: getWeekendNumber(discriminator, address)
-            };
-            assignChurch(person, address);
-            maybeSet(person, address, [
-                {name: discriminator + ' Pref Name', property: 'preferredName'},
-                {name: discriminator + ' DOB', property: 'birthDate'}
-            ]);
-            if (statusOverride) {
-                person.status = statusOverride;
-            } else {
-                insertStatus(person, address, discriminator);
-            }
-            insertSponsor(person, address, discriminator);
-            insertPhones(person, address, discriminator);
-            insertEmails(person, address, discriminator);
-            insertShirtSize(person, address[discriminator + 'ShirtSize'], defaultSize);
-            PeopleByMigrationId[address.AddressID + discriminator] = person;
-            
-            return person;
-        }
-    }
-
-    function getWeekendNumber(discriminator, address) {
-        var fieldName = discriminator + 'Weekend';
-        return address[fieldName + '#'] || address[fieldName + ' #'];
-    }
-
-    function insertStatus(person, address, discriminator) {
-        switch (address['Status ' + discriminator]) {
-            case 1:
-            case 2:
-            case 3:
-            case 4:
-            case 5:
-            case 6:
-            case 7:
-            case 13:
-                person.status = 'candidate';
-                break;
-            case 8:
-            case 9:
-            case 10:
-                person.status = 'active';
-                break;
-            case 12:
-                person.status = 'inactive';
-                break;
-            case 15:
-                person.status = 'deceased';
-                break;
-            case 11:
-            case 14:
-            case 0:
-            default:
-                person.status = 'not affiliated';
-                break;
-        }
-    }
-
-    function insertSponsor(person, address, discriminator) {
-        person.migrationSponsorSearch = [];
-        if (discriminator === 'Female' && address['Sponsor Female ID#']) {
-            person.migrationSponsorSearch.push(address['Sponsor Female ID#'] + 'Female');
-        }
-
-        if (address['Sponsor ID#']) {
-            person.migrationSponsorSearch.push(address['Sponsor ID#'] + 'Male');
-            person.migrationSponsorSearch.push(address['Sponsor ID#'] + 'Female');
-        }
-    }
-
-    function assignChurch(person, address) {
-        if (address.Church && address.Church !== null) {
-            var church = _.find(Churches, {'label': address.Church});
-            if (!church) {
-                var newChurch = {
-                    _id: Random.id(),
-                    label: address.Church
-                };
-                Churches.push(newChurch);
-            } else {
-                person.churchId = church._id;
-                person.church = address.Church;
-            }
-        }
-    }
-
-    function maybeSet(person, address, fields) {
-        fields.forEach(function (field) {
-            var data = address[field.name];
-            if (data && data !== null) {
-                person[field.property] = data;
-            }
-        })
-    }
-
-    function insertShirtSize(person, shirtSize, defaultSize) {
-        if (!shirtSize || shirtSize === null) {
-            person.shirtSize = defaultSize;
-            return;
-        }
-
-        if (shirtSize === 'Large') {
-            person.shirtSize = 'L';
-        } else if (shirtSize === 'Medium') {
-            person.shirtSize = 'M';
-        } else if (shirtSize === 'Small') {
-            person.shirtSize = 'S';
-        } else {
-            person.shirtSize = shirtSize;
-        }
-    }
-
-    function insertPhones(person, address, discriminator) {
-        person.phoneNumbers = [];
-        var hasPreferred = false;
-        [
-            {name: discriminator + ' Cell Phone', label: 'cell', canTxt: true}, 
-            {name: discriminator + ' Work Phone', label: 'work', canTxt: false}, 
-            {name: 'Home Phone', label: 'home', canTxt: false}
-        ].forEach(function (field) {
-            if (!address[field.name] || address[field.name] === null) {
-                return;
-            }
-            var phoneNumber = {
-                digits: formatPhone(address[field.name]),
-                isPreferred: true,
-                canTxt: field.canTxt,
-                label: field.label
-            };
-            if (!hasPreferred) {
-                phoneNumber.isPreferred = true;
-                hasPreferred = true;
-            }
-            person.phoneNumbers.push(phoneNumber);
-        });
-
-        function formatPhone(digits) {
-            return digits.replace(/\D/g,'');
-        }
-    }
-
-    function insertEmails(person, address, discriminator) {
-        person.emails = [];
-        var fieldName = 'Email ' + discriminator;
-        if (address[fieldName] !== null) {
-            person.emails.push({
-                address: address[fieldName],
-                isPreferred: true
-            });
-        }
-    }
-}
 
 function transformMaleExperience(data) {
-    return transformExperience('Male', data);
+    return experiencesTransformer.transform('Male', data);
 }
 
 function transformFemaleExperience(data) {
-    return transformExperience('Female', data);
-}
-
-function transformExperience(discriminator, experiences) {
-    buildWeekends(discriminator, experiences);
-
-    return experiences.map(function (experience) {
-        var attendance = {
-            migrationPersonId: experience.AddressID + discriminator,
-            migrationRoleId: experience.JobID,
-            isConfirmed: true,
-            didAttend: true
-        };
-
-        var weekendNumber = experience['BTD#'];
-        if (weekendNumber) {
-            Weekends[discriminator][weekendNumber].attendees.push(attendance);
-        }
-        return attendance;
-    });
-}
-
-var WeekendRolesByMigrationId = {};
-var candidateRoleId;
-function transformJobs(jobs) {
-    var transformedJobs = jobs.map(function (job) {
-        var role = {
-            _id: Random.id(),
-            migrationId: job.ID,
-            title: job.Job
-        };
-        role.isHead = contains(job.Job, ['Head', 'Rover', 'Rector']);
-        role.isProfessor = contains(job.Job, ['Prof']);
-        
-        WeekendRolesByMigrationId[role.migrationId] = _.cloneDeep(role);
-        delete role.migrationId;
-        return role;
-    });
-
-    candidateRoleId = Random.id();
-    transformedJobs.push({
-        _id: candidateRoleId,
-        title: 'Candidate',
-        isHead: false,
-        isProfessor: false
-    });
-    
-    return transformedJobs;
-}
-
-function contains(str, searches) {
-    return searches.some(function (search) {
-        return str.indexOf(search) !== -1;
-    });
-}
-
-var Weekends = {Male: {}, Female: {}};
-function buildWeekends(discriminator, experiences) {
-    experiences.forEach(function (experience) {
-        var weekendNumber = experience['BTD#'];
-        if (weekendNumber && !Weekends[discriminator][weekendNumber]) {
-            Weekends[discriminator][weekendNumber] = new Weekend(discriminator, weekendNumber);
-        }
-    });
-}
-
-function Weekend(gender, weekendNumber_) {
-    this._id = Random.id();           
-    this.community = 'Birmingham Tres Dias';
-    this.gender = gender;
-    this.weekendNumber = weekendNumber_;
-    this.attendees = [];
+    return experiencesTransformer.transform('Female', data);
 }
 
 function transformTables(tables) {
@@ -504,13 +235,10 @@ function transformTables(tables) {
     });
 }
 
-function addToCandidateWeekend(person) {
+function addPeopleToCandidateWeekends(person, weekends) {
     if (!person.candidateOn) {
         return;
     }
-
-    var discriminator = _.capitalize(person.gender);
-    var weekend = Weekends[discriminator][person.candidateOn];
 
     var attendance = {
         personId: person._id,
@@ -519,15 +247,17 @@ function addToCandidateWeekend(person) {
             preferredName: person.preferredName,
             lastName: person.lastName
         },
-        roleId: candidateRoleId,
+        roleId: jobTransformer.getCandidateRoleId(),
         roleTitle: 'Candidate',
         isConfirmed: true,
         didAttend: true
     };
 
+    var discriminator = _.capitalize(person.gender);
+    var weekend = _.find(weekends, {weekendGender: discriminator, weekendNumber: person.candidateOn});
     if (!weekend) {
-        weekend = new Weekend(discriminator, person.candidateOn);
-        Weekends[discriminator][person.candidateOn] = weekend;
+        weekend = experiencesTransformer.makeWeekend(discriminator, person.candidateOn);
+        weekends.push(weekend);
     }
     weekend.attendees.push(attendance);
 }
