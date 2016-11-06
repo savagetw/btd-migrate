@@ -241,20 +241,22 @@ function addPeopleToCandidateWeekends(person, weekends) {
     }
 
     var attendance = {
-        personId: person._id,
         person: {
             firstName: person.firstName,
             preferredName: person.preferredName,
-            lastName: person.lastName
+            lastName: person.lastName,
+            _id: person._id
         },
-        roleId: jobTransformer.getCandidateRoleId(),
-        roleTitle: 'Candidate',
+        role: {
+            _id: jobTransformer.getCandidateRoleId(),
+            title: 'Candidate' 
+        },
         isConfirmed: true,
         didAttend: true
     };
 
     var discriminator = _.capitalize(person.gender);
-    var weekend = _.find(weekends, {weekendGender: discriminator, weekendNumber: person.candidateOn});
+    var weekend = _.find(weekends, {gender: discriminator, weekendNumber: person.candidateOn});
     if (!weekend) {
         weekend = experiencesTransformer.makeWeekend(discriminator, person.candidateOn);
         weekends.push(weekend);
